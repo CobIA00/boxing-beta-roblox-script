@@ -1132,6 +1132,2373 @@ end
 
 
 --==============================================================================
+
+--==============================================================================
+-- MÓDULO: ScreenAnalyzer
+--==============================================================================
+
+--[[
+    ScreenAnalyzer.lua
+    Parte del Boxing Beta Autoplayer v3.0 - Universal (PC & Mobile)
+    
+    Este módulo se encarga del análisis de pantalla en tiempo real para detectar
+    elementos de la UI del juego, estados de combate, posiciones y oportunidades.
+    Es el componente crítico que convierte datos visuales en información procesable
+    para el sistema de aprendizaje automático.
+    
+    Funcionalidades principales:
+    - Detección de elementos UI del juego (barras de vida, stamina, botones)
+    - Análisis de estados de combate en tiempo real
+    - Reconocimiento de posiciones y distancias
+    - Detección de animaciones críticas
+    - Identificación de oportunidades de ataque/defensa
+    - Adaptación automática a diferentes resoluciones
+    - Optimización específica por plataforma (PC/móvil)
+    
+    Desarrollado por: Manus
+    Fecha: 06/08/2025
+]]
+
+-- Servicios de Roblox
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+local ScreenAnalyzer = {}
+ScreenAnalyzer.__index = ScreenAnalyzer
+
+-- Constantes para detección de elementos
+local UI_ELEMENTS = {
+    HEALTH_BAR = "HealthBar",
+    STAMINA_BAR = "StaminaBar",
+    OPPONENT_HEALTH = "OpponentHealth",
+    COMBO_INDICATOR = "ComboIndicator",
+    ACTION_BUTTONS = "ActionButtons",
+    ROUND_TIMER = "RoundTimer",
+    ROUND_COUNTER = "RoundCounter"
+}
+
+local COMBAT_STATES = {
+    MENU = "menu",
+    COMBAT = "combat",
+    ROUND_END = "round_end",
+    VICTORY = "victory",
+    DEFEAT = "defeat",
+    LOADING = "loading"
+}
+
+local DISTANCES = {
+    CLOSE = "close",
+    MEDIUM = "medium",
+    FAR = "far"
+}
+
+-- Patrones comunes de nombres de elementos UI en juegos de boxeo de Roblox
+local UI_PATTERNS = {
+    health = {"Health", "HP", "Life", "Vida", "Salud"},
+    stamina = {"Stamina", "Energy", "Energia", "Resistencia", "Endurance"},
+    opponent = {"Enemy", "Opponent", "Rival", "Enemigo", "Oponente"},
+    combo = {"Combo", "Chain", "Cadena", "Secuencia"},
+    timer = {"Timer", "Time", "Tiempo", "Reloj"},
+    round = {"Round", "Ronda", "Asalto"},
+    buttons = {"Punch", "Block", "Dodge", "Golpe", "Bloqueo", "Esquivar"}
+}
+
+-- Configuración de análisis por defecto
+local DEFAULT_ANALYSIS_CONFIG = {
+    -- Umbrales de detección
+    healthThreshold = 0.1,
+    staminaThreshold = 0.2,
+    distanceThreshold = {
+        close = 50,
+        medium = 150,
+        far = 300
+    },
+    
+    -- Configuración de caché
+    cacheTimeout = 0.1, -- segundos
+    maxCacheSize = 100,
+    
+    -- Configuración de confiabilidad
+    minReliability = 0.6,
+    maxAnalysisTime = 0.05, -- máximo tiempo de análisis por frame
+    
+    -- Configuración de threading
+    useCoroutines = true,
+    maxConcurrentAnalysis = 3
+}
+
+function ScreenAnalyzer.new(platformDetection, adaptiveConfig)
+    local self = setmetatable({}, ScreenAnalyzer)
+    
+    -- Inyección de dependencias
+    self.platformDetection = platformDetection or error("PlatformDetection requerido")
+    self.adaptiveConfig = adaptiveConfig or error("AdaptiveConfig requerido")
+    
+    -- Información del dispositivo y configuración
+    self.deviceInfo = self.platformDetection:getDeviceInfo()
+    self.config = self.adaptiveConfig:getConfig()
+    
+    -- Estado interno del analizador
+    self.isInitialized = false
+    self.isAnalyzing = false
+    self.lastAnalysisTime = 0
+    self.analysisInterval = self.config.screenAnalysisInterval or 0.06
+    
+    -- Caché de análisis para optimización
+    self.cache = {
+        gameState = nil,
+        lastCacheTime = 0,
+        cacheTimeout = DEFAULT_ANALYSIS_CONFIG.cacheTimeout,
+        elementPositions = {},
+        uiElements = {}
+    }
+    
+    -- Configuración de análisis adaptativa
+    self.analysisConfig = {}
+    for key, value in pairs(DEFAULT_ANALYSIS_CONFIG) do
+        self.analysisConfig[key] = value
+    end
+    
+    -- Adaptar configuración según la plataforma
+    self:adaptConfigForPlatform()
+    
+    -- Referencias a elementos de UI del juego
+    self.gameUI = {
+        playerGui = nil,
+        screenGui = nil,
+        camera = nil,
+        viewport = Vector2.new(0, 0)
+    }
+    
+    -- Estado del juego detectado
+    self.detectedState = {
+        combat = {
+            inCombat = false,
+            playerHealth = 100,
+            opponentHealth = 100,
+            playerStamina = 100,
+            opponentStunned = false,
+            distanceToOpponent = DISTANCES.MEDIUM
+        },
+        opportunities = {
+            canAttack = false,
+            shouldDodge = false,
+            shouldBlock = false,
+            counterAttackWindow = false,
+            comboOpportunity = false
+        },
+        environment = {
+            nearEdge = false,
+            roundTimeLeft = 180,
+            currentRound = 1,
+            gamePhase = COMBAT_STATES.MENU
+        },
+        visual = {
+            lastAnalysisTime = 0,
+            analysisReliability = 0,
+            screenResolution = Vector2.new(0, 0),
+            frameRate = 60
+        }
+    }
+    
+    -- Estadísticas de rendimiento
+    self.performance = {
+        totalAnalyses = 0,
+        successfulAnalyses = 0,
+        averageAnalysisTime = 0,
+        lastFrameTime = 0,
+        frameRate = 60
+    }
+    
+    -- Callbacks para eventos
+    self.callbacks = {
+        onStateChanged = nil,
+        onElementDetected = nil,
+        onAnalysisComplete = nil
+    }
+    
+    -- Inicializar el analizador
+    self:initialize()
+    
+    return self
+end
+
+-- Adaptar configuración según la plataforma
+function ScreenAnalyzer:adaptConfigForPlatform()
+    if self.deviceInfo.isMobile then
+        -- Ajustes para móvil: análisis menos frecuente para ahorrar batería
+        self.analysisInterval = self.analysisInterval * 1.3
+        self.analysisConfig.maxAnalysisTime = self.analysisConfig.maxAnalysisTime * 1.5
+        self.analysisConfig.cacheTimeout = self.analysisConfig.cacheTimeout * 1.2
+        self.analysisConfig.maxConcurrentAnalysis = 2
+        
+        if not self.deviceInfo.isTablet then
+            -- Ajustes adicionales para teléfonos
+            self.analysisConfig.minReliability = 0.5 -- Menos estricto en teléfonos
+            self.analysisConfig.maxCacheSize = 50
+        end
+    else
+        -- Ajustes para PC: análisis más frecuente y preciso
+        self.analysisConfig.minReliability = 0.7
+        self.analysisConfig.maxCacheSize = 150
+        self.analysisConfig.maxConcurrentAnalysis = 4
+    end
+    
+    print("[ScreenAnalyzer] Configuración adaptada para:", self.deviceInfo.deviceType)
+end
+
+-- Inicializar el analizador
+function ScreenAnalyzer:initialize()
+    local success, error = pcall(function()
+        -- Obtener referencias a elementos de UI
+        self:updateUIReferences()
+        
+        -- Configurar eventos de cambio de resolución
+        self:setupResolutionEvents()
+        
+        -- Inicializar sistema de detección
+        self:initializeDetectionSystem()
+        
+        self.isInitialized = true
+        print("[ScreenAnalyzer] Inicializado correctamente")
+    end)
+    
+    if not success then
+        warn("[ScreenAnalyzer] Error en inicialización:", error)
+        self.isInitialized = false
+    end
+end
+
+-- Actualizar referencias a elementos de UI
+function ScreenAnalyzer:updateUIReferences()
+    -- Obtener PlayerGui
+    if LocalPlayer then
+        self.gameUI.playerGui = LocalPlayer:WaitForChild("PlayerGui", 5)
+    end
+    
+    -- Obtener cámara actual
+    self.gameUI.camera = workspace.CurrentCamera
+    if self.gameUI.camera then
+        self.gameUI.viewport = self.gameUI.camera.ViewportSize
+        self.detectedState.visual.screenResolution = self.gameUI.viewport
+    end
+    
+    -- Buscar ScreenGui principal del juego
+    if self.gameUI.playerGui then
+        for _, gui in pairs(self.gameUI.playerGui:GetChildren()) do
+            if gui:IsA("ScreenGui") and gui.Enabled then
+                -- Heurística para identificar la UI principal del juego
+                if self:isMainGameUI(gui) then
+                    self.gameUI.screenGui = gui
+                    break
+                end
+            end
+        end
+    end
+end
+
+-- Determinar si un ScreenGui es la UI principal del juego
+function ScreenAnalyzer:isMainGameUI(screenGui)
+    local score = 0
+    local children = screenGui:GetChildren()
+    
+    -- Buscar elementos típicos de UI de juego de boxeo
+    for _, child in pairs(children) do
+        local name = child.Name:lower()
+        
+        -- Buscar barras de vida/stamina
+        for _, pattern in pairs(UI_PATTERNS.health) do
+            if name:find(pattern:lower()) then
+                score = score + 3
+            end
+        end
+        
+        for _, pattern in pairs(UI_PATTERNS.stamina) do
+            if name:find(pattern:lower()) then
+                score = score + 2
+            end
+        end
+        
+        -- Buscar botones de acción
+        for _, pattern in pairs(UI_PATTERNS.buttons) do
+            if name:find(pattern:lower()) then
+                score = score + 1
+            end
+        end
+        
+        -- Buscar timers/rounds
+        for _, pattern in pairs(UI_PATTERNS.timer) do
+            if name:find(pattern:lower()) then
+                score = score + 2
+            end
+        end
+    end
+    
+    -- Si tiene suficientes elementos típicos, probablemente es la UI principal
+    return score >= 5
+end
+
+-- Configurar eventos de cambio de resolución
+function ScreenAnalyzer:setupResolutionEvents()
+    if self.gameUI.camera then
+        self.gameUI.camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            self.gameUI.viewport = self.gameUI.camera.ViewportSize
+            self.detectedState.visual.screenResolution = self.gameUI.viewport
+            
+            -- Limpiar caché cuando cambia la resolución
+            self:clearCache()
+            
+            -- Actualizar referencias de UI
+            self:updateUIReferences()
+        end)
+    end
+end
+
+-- Inicializar sistema de detección
+function ScreenAnalyzer:initializeDetectionSystem()
+    -- Crear detectores especializados
+    self.detectors = {
+        uiElements = self:createUIElementDetector(),
+        combatState = self:createCombatStateDetector(),
+        positions = self:createPositionDetector(),
+        animations = self:createAnimationDetector()
+    }
+    
+    print("[ScreenAnalyzer] Sistema de detección inicializado")
+end
+
+-- Limpiar caché
+function ScreenAnalyzer:clearCache()
+    self.cache.gameState = nil
+    self.cache.lastCacheTime = 0
+    self.cache.elementPositions = {}
+    self.cache.uiElements = {}
+end
+
+
+--==============================================================================
+-- DETECCIÓN DE ELEMENTOS UI
+--==============================================================================
+
+-- Crear detector de elementos UI
+function ScreenAnalyzer:createUIElementDetector()
+    local detector = {
+        -- Elementos UI detectados
+        elements = {
+            playerHealth = nil,
+            opponentHealth = nil,
+            playerStamina = nil,
+            comboIndicator = nil,
+            actionButtons = {},
+            roundTimer = nil,
+            roundCounter = nil
+        },
+        
+        -- Historial de detecciones para estabilidad
+        history = {
+            playerHealth = {},
+            opponentHealth = {},
+            playerStamina = {},
+            maxHistorySize = 5
+        }
+    }
+    
+    -- Métodos del detector
+    detector.detectAllElements = function(self, screenGui)
+        local startTime = os.clock()
+        local detectedElements = {}
+        
+        -- Si no hay ScreenGui, intentar encontrarlo
+        if not screenGui and self.gameUI and self.gameUI.playerGui then
+            for _, gui in pairs(self.gameUI.playerGui:GetChildren()) do
+                if gui:IsA("ScreenGui") and gui.Enabled and self:isMainGameUI(gui) then
+                    screenGui = gui
+                    break
+                end
+            end
+        end
+        
+        if not screenGui then
+            return detectedElements, 0 -- No se encontró ScreenGui
+        end
+        
+        -- Detectar barras de vida y stamina
+        self:detectHealthBars(screenGui, detectedElements)
+        self:detectStaminaBar(screenGui, detectedElements)
+        
+        -- Detectar indicadores de combo
+        self:detectComboIndicator(screenGui, detectedElements)
+        
+        -- Detectar botones de acción
+        self:detectActionButtons(screenGui, detectedElements)
+        
+        -- Detectar timer y contador de rounds
+        self:detectRoundInfo(screenGui, detectedElements)
+        
+        -- Calcular tiempo de análisis
+        local analysisTime = os.clock() - startTime
+        
+        -- Actualizar caché
+        for elementType, element in pairs(detectedElements) do
+            self.cache.uiElements[elementType] = {
+                element = element,
+                timestamp = os.clock()
+            }
+        end
+        
+        return detectedElements, analysisTime
+    end
+    
+    return detector
+end
+
+-- Detectar barras de vida (jugador y oponente)
+function ScreenAnalyzer:detectHealthBars(screenGui, detectedElements)
+    -- Buscar primero en caché
+    if self.cache.uiElements.playerHealth and 
+       os.clock() - self.cache.uiElements.playerHealth.timestamp < self.analysisConfig.cacheTimeout then
+        detectedElements.playerHealth = self.cache.uiElements.playerHealth.element
+    end
+    
+    if self.cache.uiElements.opponentHealth and 
+       os.clock() - self.cache.uiElements.opponentHealth.timestamp < self.analysisConfig.cacheTimeout then
+        detectedElements.opponentHealth = self.cache.uiElements.opponentHealth.element
+    end
+    
+    -- Si ya tenemos ambos elementos en caché, salir
+    if detectedElements.playerHealth and detectedElements.opponentHealth then
+        return
+    end
+    
+    -- Buscar barras de vida en la UI
+    local potentialHealthBars = {}
+    
+    -- Función recursiva para buscar barras de vida
+    local function findHealthBars(parent)
+        for _, child in pairs(parent:GetChildren()) do
+            -- Verificar si es una barra de vida por nombre
+            local name = child.Name:lower()
+            local isHealthBar = false
+            
+            for _, pattern in pairs(UI_PATTERNS.health) do
+                if name:find(pattern:lower()) then
+                    isHealthBar = true
+                    break
+                end
+            end
+            
+            -- Verificar si es una barra de vida por apariencia
+            if child:IsA("Frame") or child:IsA("ImageLabel") then
+                -- Las barras de vida suelen ser rectangulares y tener colores específicos
+                if child.Size.X.Scale > 0.05 and child.Size.Y.Scale < 0.1 then
+                    -- Verificar color (rojo, verde, etc.)
+                    local bgColor = child.BackgroundColor3
+                    if (bgColor.R > 0.5 and bgColor.G < 0.3 and bgColor.B < 0.3) or -- Rojo
+                       (bgColor.R < 0.3 and bgColor.G > 0.5 and bgColor.B < 0.3) then -- Verde
+                        isHealthBar = true
+                    end
+                end
+            end
+            
+            -- Si es una barra de vida potencial, agregarla a la lista
+            if isHealthBar then
+                table.insert(potentialHealthBars, child)
+            end
+            
+            -- Buscar recursivamente
+            if #child:GetChildren() > 0 then
+                findHealthBars(child)
+            end
+        end
+    end
+    
+    -- Iniciar búsqueda
+    findHealthBars(screenGui)
+    
+    -- Clasificar barras de vida (jugador vs oponente)
+    if #potentialHealthBars > 0 then
+        -- Ordenar por posición (generalmente la barra del jugador está abajo o a la izquierda)
+        table.sort(potentialHealthBars, function(a, b)
+            -- Priorizar posición Y (más abajo = jugador)
+            if math.abs(a.AbsolutePosition.Y - b.AbsolutePosition.Y) > 50 then
+                return a.AbsolutePosition.Y > b.AbsolutePosition.Y
+            end
+            -- Si están a la misma altura, priorizar posición X (más a la izquierda = jugador)
+            return a.AbsolutePosition.X < b.AbsolutePosition.X
+        end)
+        
+        -- Asignar barras de vida
+        if #potentialHealthBars >= 2 then
+            -- Si hay al menos dos barras, asumir que la primera es del jugador y la segunda del oponente
+            detectedElements.playerHealth = potentialHealthBars[1]
+            detectedElements.opponentHealth = potentialHealthBars[2]
+        elseif #potentialHealthBars == 1 then
+            -- Si solo hay una barra, verificar si es del jugador u oponente
+            local bar = potentialHealthBars[1]
+            local name = bar.Name:lower()
+            
+            -- Verificar si el nombre contiene "enemy", "opponent", etc.
+            local isOpponent = false
+            for _, pattern in pairs(UI_PATTERNS.opponent) do
+                if name:find(pattern:lower()) then
+                    isOpponent = true
+                    break
+                end
+            end
+            
+            if isOpponent then
+                detectedElements.opponentHealth = bar
+            else
+                detectedElements.playerHealth = bar
+            end
+        end
+    end
+end
+
+-- Detectar barra de stamina
+function ScreenAnalyzer:detectStaminaBar(screenGui, detectedElements)
+    -- Buscar primero en caché
+    if self.cache.uiElements.playerStamina and 
+       os.clock() - self.cache.uiElements.playerStamina.timestamp < self.analysisConfig.cacheTimeout then
+        detectedElements.playerStamina = self.cache.uiElements.playerStamina.element
+        return
+    end
+    
+    -- Buscar barra de stamina en la UI
+    local potentialStaminaBars = {}
+    
+    -- Función recursiva para buscar barras de stamina
+    local function findStaminaBars(parent)
+        for _, child in pairs(parent:GetChildren()) do
+            -- Verificar si es una barra de stamina por nombre
+            local name = child.Name:lower()
+            local isStaminaBar = false
+            
+            for _, pattern in pairs(UI_PATTERNS.stamina) do
+                if name:find(pattern:lower()) then
+                    isStaminaBar = true
+                    break
+                end
+            end
+            
+            -- Verificar si es una barra de stamina por apariencia
+            if child:IsA("Frame") or child:IsA("ImageLabel") then
+                -- Las barras de stamina suelen ser rectangulares y tener colores específicos
+                if child.Size.X.Scale > 0.05 and child.Size.Y.Scale < 0.1 then
+                    -- Verificar color (azul, amarillo, etc.)
+                    local bgColor = child.BackgroundColor3
+                    if (bgColor.R < 0.3 and bgColor.G < 0.3 and bgColor.B > 0.5) or -- Azul
+                       (bgColor.R > 0.5 and bgColor.G > 0.5 and bgColor.B < 0.3) then -- Amarillo
+                        isStaminaBar = true
+                    end
+                end
+            end
+            
+            -- Si es una barra de stamina potencial, agregarla a la lista
+            if isStaminaBar then
+                table.insert(potentialStaminaBars, child)
+            end
+            
+            -- Buscar recursivamente
+            if #child:GetChildren() > 0 then
+                findStaminaBars(child)
+            end
+        end
+    end
+    
+    -- Iniciar búsqueda
+    findStaminaBars(screenGui)
+    
+    -- Seleccionar la barra de stamina más probable
+    if #potentialStaminaBars > 0 then
+        -- Ordenar por puntuación de probabilidad
+        table.sort(potentialStaminaBars, function(a, b)
+            local scoreA = 0
+            local scoreB = 0
+            
+            -- Puntuación por nombre
+            local nameA = a.Name:lower()
+            local nameB = b.Name:lower()
+            
+            for _, pattern in pairs(UI_PATTERNS.stamina) do
+                if nameA:find(pattern:lower()) then scoreA = scoreA + 2 end
+                if nameB:find(pattern:lower()) then scoreB = scoreB + 2 end
+            end
+            
+            -- Puntuación por color
+            if a:IsA("Frame") or a:IsA("ImageLabel") then
+                local colorA = a.BackgroundColor3
+                if colorA.R < 0.3 and colorA.G < 0.3 and colorA.B > 0.5 then -- Azul
+                    scoreA = scoreA + 1
+                elseif colorA.R > 0.5 and colorA.G > 0.5 and colorA.B < 0.3 then -- Amarillo
+                    scoreA = scoreA + 1
+                end
+            end
+            
+            if b:IsA("Frame") or b:IsA("ImageLabel") then
+                local colorB = b.BackgroundColor3
+                if colorB.R < 0.3 and colorB.G < 0.3 and colorB.B > 0.5 then -- Azul
+                    scoreB = scoreB + 1
+                elseif colorB.R > 0.5 and colorB.G > 0.5 and colorB.B < 0.3 then -- Amarillo
+                    scoreB = scoreB + 1
+                end
+            end
+            
+            -- Puntuación por posición (generalmente cerca de la barra de vida del jugador)
+            if detectedElements.playerHealth then
+                local distA = (a.AbsolutePosition - detectedElements.playerHealth.AbsolutePosition).Magnitude
+                local distB = (b.AbsolutePosition - detectedElements.playerHealth.AbsolutePosition).Magnitude
+                
+                if distA < distB then scoreA = scoreA + 2 end
+                if distB < distA then scoreB = scoreB + 2 end
+            end
+            
+            return scoreA > scoreB
+        end)
+        
+        -- Seleccionar la barra con mayor puntuación
+        detectedElements.playerStamina = potentialStaminaBars[1]
+    end
+end
+
+-- Detectar indicador de combo
+function ScreenAnalyzer:detectComboIndicator(screenGui, detectedElements)
+    -- Buscar primero en caché
+    if self.cache.uiElements.comboIndicator and 
+       os.clock() - self.cache.uiElements.comboIndicator.timestamp < self.analysisConfig.cacheTimeout then
+        detectedElements.comboIndicator = self.cache.uiElements.comboIndicator.element
+        return
+    end
+    
+    -- Buscar indicador de combo en la UI
+    local potentialComboIndicators = {}
+    
+    -- Función recursiva para buscar indicadores de combo
+    local function findComboIndicators(parent)
+        for _, child in pairs(parent:GetChildren()) do
+            -- Verificar si es un indicador de combo por nombre
+            local name = child.Name:lower()
+            local isComboIndicator = false
+            
+            for _, pattern in pairs(UI_PATTERNS.combo) do
+                if name:find(pattern:lower()) then
+                    isComboIndicator = true
+                    break
+                end
+            end
+            
+            -- Verificar si es un indicador de combo por contenido (TextLabel)
+            if child:IsA("TextLabel") then
+                local text = child.Text:lower()
+                if text:find("combo") or text:find("x%d+") then -- Buscar "combo" o "x2", "x3", etc.
+                    isComboIndicator = true
+                end
+            end
+            
+            -- Si es un indicador de combo potencial, agregarlo a la lista
+            if isComboIndicator then
+                table.insert(potentialComboIndicators, child)
+            end
+            
+            -- Buscar recursivamente
+            if #child:GetChildren() > 0 then
+                findComboIndicators(child)
+            end
+        end
+    end
+    
+    -- Iniciar búsqueda
+    findComboIndicators(screenGui)
+    
+    -- Seleccionar el indicador de combo más probable
+    if #potentialComboIndicators > 0 then
+        -- Ordenar por puntuación de probabilidad
+        table.sort(potentialComboIndicators, function(a, b)
+            local scoreA = 0
+            local scoreB = 0
+            
+            -- Puntuación por nombre
+            local nameA = a.Name:lower()
+            local nameB = b.Name:lower()
+            
+            for _, pattern in pairs(UI_PATTERNS.combo) do
+                if nameA:find(pattern:lower()) then scoreA = scoreA + 2 end
+                if nameB:find(pattern:lower()) then scoreB = scoreB + 2 end
+            end
+            
+            -- Puntuación por contenido (TextLabel)
+            if a:IsA("TextLabel") then
+                local textA = a.Text:lower()
+                if textA:find("combo") then scoreA = scoreA + 3 end
+                if textA:find("x%d+") then scoreA = scoreA + 3 end
+            end
+            
+            if b:IsA("TextLabel") then
+                local textB = b.Text:lower()
+                if textB:find("combo") then scoreB = scoreB + 3 end
+                if textB:find("x%d+") then scoreB = scoreB + 3 end
+            end
+            
+            return scoreA > scoreB
+        end)
+        
+        -- Seleccionar el indicador con mayor puntuación
+        detectedElements.comboIndicator = potentialComboIndicators[1]
+    end
+end
+
+-- Detectar botones de acción
+function ScreenAnalyzer:detectActionButtons(screenGui, detectedElements)
+    -- Buscar primero en caché
+    if self.cache.uiElements.actionButtons and 
+       os.clock() - self.cache.uiElements.actionButtons.timestamp < self.analysisConfig.cacheTimeout then
+        detectedElements.actionButtons = self.cache.uiElements.actionButtons.element
+        return
+    end
+    
+    -- Buscar botones de acción en la UI
+    local potentialActionButtons = {}
+    
+    -- Función recursiva para buscar botones de acción
+    local function findActionButtons(parent)
+        for _, child in pairs(parent:GetChildren()) do
+            -- Verificar si es un botón de acción por nombre
+            local name = child.Name:lower()
+            local isActionButton = false
+            
+            -- Palabras clave para botones de acción en juegos de boxeo
+            local actionKeywords = {
+                "punch", "golpe", "hit", "attack", "atacar",
+                "block", "bloquear", "defend", "defender",
+                "dodge", "esquivar", "evade", "evadir",
+                "jab", "hook", "uppercut", "cross"
+            }
+            
+            for _, keyword in pairs(actionKeywords) do
+                if name:find(keyword) then
+                    isActionButton = true
+                    break
+                end
+            end
+            
+            -- Verificar si es un botón por apariencia
+            if (child:IsA("ImageButton") or child:IsA("TextButton")) then
+                isActionButton = true
+            elseif child:IsA("Frame") or child:IsA("ImageLabel") then
+                -- Verificar si tiene hijos que son botones
+                for _, grandchild in pairs(child:GetChildren()) do
+                    if grandchild:IsA("ImageButton") or grandchild:IsA("TextButton") then
+                        isActionButton = true
+                        break
+                    end
+                end
+            end
+            
+            -- Si es un botón de acción potencial, agregarlo a la lista
+            if isActionButton then
+                table.insert(potentialActionButtons, child)
+            end
+            
+            -- Buscar recursivamente
+            if #child:GetChildren() > 0 then
+                findActionButtons(child)
+            end
+        end
+    end
+    
+    -- Iniciar búsqueda
+    findActionButtons(screenGui)
+    
+    -- Clasificar botones de acción
+    if #potentialActionButtons > 0 then
+        local actionButtons = {}
+        
+        -- Clasificar botones por tipo
+        for _, button in pairs(potentialActionButtons) do
+            local name = button.Name:lower()
+            local buttonType = "unknown"
+            
+            -- Determinar tipo de botón
+            if name:find("punch") or name:find("golpe") or name:find("hit") or name:find("attack") or
+               name:find("jab") or name:find("hook") or name:find("uppercut") or name:find("cross") then
+                buttonType = "attack"
+            elseif name:find("block") or name:find("bloquear") or name:find("defend") then
+                buttonType = "block"
+            elseif name:find("dodge") or name:find("esquivar") or name:find("evade") then
+                buttonType = "dodge"
+            end
+            
+            -- Agregar botón a la lista clasificada
+            table.insert(actionButtons, {
+                element = button,
+                type = buttonType
+            })
+        end
+        
+        detectedElements.actionButtons = actionButtons
+    end
+end
+
+-- Detectar timer y contador de rounds
+function ScreenAnalyzer:detectRoundInfo(screenGui, detectedElements)
+    -- Buscar primero en caché
+    if self.cache.uiElements.roundTimer and 
+       os.clock() - self.cache.uiElements.roundTimer.timestamp < self.analysisConfig.cacheTimeout then
+        detectedElements.roundTimer = self.cache.uiElements.roundTimer.element
+    end
+    
+    if self.cache.uiElements.roundCounter and 
+       os.clock() - self.cache.uiElements.roundCounter.timestamp < self.analysisConfig.cacheTimeout then
+        detectedElements.roundCounter = self.cache.uiElements.roundCounter.element
+    end
+    
+    -- Si ya tenemos ambos elementos en caché, salir
+    if detectedElements.roundTimer and detectedElements.roundCounter then
+        return
+    end
+    
+    -- Buscar timer y contador de rounds en la UI
+    local potentialTimers = {}
+    local potentialCounters = {}
+    
+    -- Función recursiva para buscar timer y contador
+    local function findRoundInfo(parent)
+        for _, child in pairs(parent:GetChildren()) do
+            -- Verificar si es un timer por nombre
+            local name = child.Name:lower()
+            local isTimer = false
+            local isCounter = false
+            
+            for _, pattern in pairs(UI_PATTERNS.timer) do
+                if name:find(pattern:lower()) then
+                    isTimer = true
+                    break
+                end
+            end
+            
+            for _, pattern in pairs(UI_PATTERNS.round) do
+                if name:find(pattern:lower()) then
+                    isCounter = true
+                    break
+                end
+            end
+            
+            -- Verificar si es un timer por contenido (TextLabel)
+            if child:IsA("TextLabel") then
+                local text = child.Text
+                -- Buscar formato de tiempo (mm:ss)
+                if text:match("%d+:%d+") then
+                    isTimer = true
+                end
+                
+                -- Buscar formato de round (Round X, X/Y)
+                if text:match("Round %d+") or text:match("%d+/%d+") then
+                    isCounter = true
+                end
+            end
+            
+            -- Si es un timer potencial, agregarlo a la lista
+            if isTimer then
+                table.insert(potentialTimers, child)
+            end
+            
+            -- Si es un contador potencial, agregarlo a la lista
+            if isCounter then
+                table.insert(potentialCounters, child)
+            end
+            
+            -- Buscar recursivamente
+            if #child:GetChildren() > 0 then
+                findRoundInfo(child)
+            end
+        end
+    end
+    
+    -- Iniciar búsqueda
+    findRoundInfo(screenGui)
+    
+    -- Seleccionar el timer más probable
+    if #potentialTimers > 0 then
+        -- Ordenar por puntuación de probabilidad
+        table.sort(potentialTimers, function(a, b)
+            local scoreA = 0
+            local scoreB = 0
+            
+            -- Puntuación por nombre
+            local nameA = a.Name:lower()
+            local nameB = b.Name:lower()
+            
+            for _, pattern in pairs(UI_PATTERNS.timer) do
+                if nameA:find(pattern:lower()) then scoreA = scoreA + 2 end
+                if nameB:find(pattern:lower()) then scoreB = scoreB + 2 end
+            end
+            
+            -- Puntuación por contenido (TextLabel)
+            if a:IsA("TextLabel") then
+                local textA = a.Text
+                if textA:match("%d+:%d+") then scoreA = scoreA + 3 end
+            end
+            
+            if b:IsA("TextLabel") then
+                local textB = b.Text
+                if textB:match("%d+:%d+") then scoreB = scoreB + 3 end
+            end
+            
+            -- Puntuación por posición (generalmente en la parte superior)
+            if a.AbsolutePosition.Y < b.AbsolutePosition.Y then
+                scoreA = scoreA + 1
+            else
+                scoreB = scoreB + 1
+            end
+            
+            return scoreA > scoreB
+        end)
+        
+        -- Seleccionar el timer con mayor puntuación
+        detectedElements.roundTimer = potentialTimers[1]
+    end
+    
+    -- Seleccionar el contador de rounds más probable
+    if #potentialCounters > 0 then
+        -- Ordenar por puntuación de probabilidad
+        table.sort(potentialCounters, function(a, b)
+            local scoreA = 0
+            local scoreB = 0
+            
+            -- Puntuación por nombre
+            local nameA = a.Name:lower()
+            local nameB = b.Name:lower()
+            
+            for _, pattern in pairs(UI_PATTERNS.round) do
+                if nameA:find(pattern:lower()) then scoreA = scoreA + 2 end
+                if nameB:find(pattern:lower()) then scoreB = scoreB + 2 end
+            end
+            
+            -- Puntuación por contenido (TextLabel)
+            if a:IsA("TextLabel") then
+                local textA = a.Text
+                if textA:match("Round %d+") then scoreA = scoreA + 3 end
+                if textA:match("%d+/%d+") then scoreA = scoreA + 2 end
+            end
+            
+            if b:IsA("TextLabel") then
+                local textB = b.Text
+                if textB:match("Round %d+") then scoreB = scoreB + 3 end
+                if textB:match("%d+/%d+") then scoreB = scoreB + 2 end
+            end
+            
+            -- Puntuación por posición (generalmente en la parte superior)
+            if a.AbsolutePosition.Y < b.AbsolutePosition.Y then
+                scoreA = scoreA + 1
+            else
+                scoreB = scoreB + 1
+            end
+            
+            return scoreA > scoreB
+        end)
+        
+        -- Seleccionar el contador con mayor puntuación
+        detectedElements.roundCounter = potentialCounters[1]
+    end
+end
+
+-- Extraer valores de los elementos UI
+function ScreenAnalyzer:extractUIValues(detectedElements)
+    local values = {
+        playerHealth = 100,
+        opponentHealth = 100,
+        playerStamina = 100,
+        comboCount = 0,
+        roundTime = 180,
+        currentRound = 1,
+        maxRounds = 3
+    }
+    
+    -- Extraer valor de barra de vida del jugador
+    if detectedElements.playerHealth then
+        local element = detectedElements.playerHealth
+        
+        -- Intentar diferentes métodos de extracción
+        if element:IsA("Frame") or element:IsA("ImageLabel") then
+            -- Método 1: Usar Size.X.Scale
+            if element.Size.X.Scale > 0 and element.Size.X.Scale <= 1 then
+                values.playerHealth = element.Size.X.Scale * 100
+            end
+            
+            -- Método 2: Buscar un hijo que sea la barra de progreso
+            for _, child in pairs(element:GetChildren()) do
+                if child:IsA("Frame") or child:IsA("ImageLabel") then
+                    if child.Size.X.Scale > 0 and child.Size.X.Scale <= 1 then
+                        values.playerHealth = child.Size.X.Scale * 100
+                        break
+                    end
+                end
+            end
+            
+            -- Método 3: Usar TextLabel si existe
+            for _, child in pairs(element:GetDescendants()) do
+                if child:IsA("TextLabel") then
+                    local text = child.Text
+                    local number = tonumber(text:match("%d+"))
+                    if number and number >= 0 and number <= 100 then
+                        values.playerHealth = number
+                        break
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Extraer valor de barra de vida del oponente
+    if detectedElements.opponentHealth then
+        local element = detectedElements.opponentHealth
+        
+        -- Intentar diferentes métodos de extracción
+        if element:IsA("Frame") or element:IsA("ImageLabel") then
+            -- Método 1: Usar Size.X.Scale
+            if element.Size.X.Scale > 0 and element.Size.X.Scale <= 1 then
+                values.opponentHealth = element.Size.X.Scale * 100
+            end
+            
+            -- Método 2: Buscar un hijo que sea la barra de progreso
+            for _, child in pairs(element:GetChildren()) do
+                if child:IsA("Frame") or child:IsA("ImageLabel") then
+                    if child.Size.X.Scale > 0 and child.Size.X.Scale <= 1 then
+                        values.opponentHealth = child.Size.X.Scale * 100
+                        break
+                    end
+                end
+            end
+            
+            -- Método 3: Usar TextLabel si existe
+            for _, child in pairs(element:GetDescendants()) do
+                if child:IsA("TextLabel") then
+                    local text = child.Text
+                    local number = tonumber(text:match("%d+"))
+                    if number and number >= 0 and number <= 100 then
+                        values.opponentHealth = number
+                        break
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Extraer valor de barra de stamina
+    if detectedElements.playerStamina then
+        local element = detectedElements.playerStamina
+        
+        -- Intentar diferentes métodos de extracción
+        if element:IsA("Frame") or element:IsA("ImageLabel") then
+            -- Método 1: Usar Size.X.Scale
+            if element.Size.X.Scale > 0 and element.Size.X.Scale <= 1 then
+                values.playerStamina = element.Size.X.Scale * 100
+            end
+            
+            -- Método 2: Buscar un hijo que sea la barra de progreso
+            for _, child in pairs(element:GetChildren()) do
+                if child:IsA("Frame") or child:IsA("ImageLabel") then
+                    if child.Size.X.Scale > 0 and child.Size.X.Scale <= 1 then
+                        values.playerStamina = child.Size.X.Scale * 100
+                        break
+                    end
+                end
+            end
+            
+            -- Método 3: Usar TextLabel si existe
+            for _, child in pairs(element:GetDescendants()) do
+                if child:IsA("TextLabel") then
+                    local text = child.Text
+                    local number = tonumber(text:match("%d+"))
+                    if number and number >= 0 and number <= 100 then
+                        values.playerStamina = number
+                        break
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Extraer contador de combo
+    if detectedElements.comboIndicator then
+        local element = detectedElements.comboIndicator
+        
+        -- Intentar extraer valor de combo
+        if element:IsA("TextLabel") then
+            local text = element.Text
+            local comboValue = tonumber(text:match("x(%d+)")) or tonumber(text:match("(%d+)"))
+            if comboValue and comboValue > 0 then
+                values.comboCount = comboValue
+            end
+        else
+            -- Buscar TextLabel hijo
+            for _, child in pairs(element:GetDescendants()) do
+                if child:IsA("TextLabel") then
+                    local text = child.Text
+                    local comboValue = tonumber(text:match("x(%d+)")) or tonumber(text:match("(%d+)"))
+                    if comboValue and comboValue > 0 then
+                        values.comboCount = comboValue
+                        break
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Extraer tiempo de round
+    if detectedElements.roundTimer then
+        local element = detectedElements.roundTimer
+        
+        -- Intentar extraer tiempo
+        if element:IsA("TextLabel") then
+            local text = element.Text
+            local minutes, seconds = text:match("(%d+):(%d+)")
+            if minutes and seconds then
+                values.roundTime = tonumber(minutes) * 60 + tonumber(seconds)
+            end
+        else
+            -- Buscar TextLabel hijo
+            for _, child in pairs(element:GetDescendants()) do
+                if child:IsA("TextLabel") then
+                    local text = child.Text
+                    local minutes, seconds = text:match("(%d+):(%d+)")
+                    if minutes and seconds then
+                        values.roundTime = tonumber(minutes) * 60 + tonumber(seconds)
+                        break
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Extraer número de round
+    if detectedElements.roundCounter then
+        local element = detectedElements.roundCounter
+        
+        -- Intentar extraer número de round
+        if element:IsA("TextLabel") then
+            local text = element.Text
+            local currentRound, maxRounds = text:match("(%d+)/(%d+)")
+            if currentRound and maxRounds then
+                values.currentRound = tonumber(currentRound)
+                values.maxRounds = tonumber(maxRounds)
+            else
+                local roundNumber = text:match("Round (%d+)")
+                if roundNumber then
+                    values.currentRound = tonumber(roundNumber)
+                end
+            end
+        else
+            -- Buscar TextLabel hijo
+            for _, child in pairs(element:GetDescendants()) do
+                if child:IsA("TextLabel") then
+                    local text = child.Text
+                    local currentRound, maxRounds = text:match("(%d+)/(%d+)")
+                    if currentRound and maxRounds then
+                        values.currentRound = tonumber(currentRound)
+                        values.maxRounds = tonumber(maxRounds)
+                        break
+                    else
+                        local roundNumber = text:match("Round (%d+)")
+                        if roundNumber then
+                            values.currentRound = tonumber(roundNumber)
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    return values
+end
+
+
+--==============================================================================
+-- ANÁLISIS DE ESTADOS DE COMBATE
+--==============================================================================
+
+-- Crear detector de estados de combate
+function ScreenAnalyzer:createCombatStateDetector()
+    local detector = {
+        -- Estado de combate actual
+        currentState = {
+            inCombat = false,
+            opponentAttacking = false,
+            opponentStunned = false,
+            blockSuccessful = false,
+            counterOpportunity = false
+        },
+        
+        -- Historial de estados para estabilidad
+        history = {
+            inCombat = {},
+            opponentAttacking = {},
+            opponentStunned = {},
+            maxHistorySize = 5
+        }
+    }
+    
+    -- Métodos del detector
+    detector.analyzeCombatState = function(self, uiValues, screenGui)
+        local startTime = os.clock()
+        local combatState = {
+            inCombat = false,
+            opponentAttacking = false,
+            opponentStunned = false,
+            blockSuccessful = false,
+            counterOpportunity = false
+        }
+        
+        -- Determinar si está en combate basado en UI
+        combatState.inCombat = self:detectInCombatState(uiValues, screenGui)
+        
+        -- Si está en combate, analizar estados específicos
+        if combatState.inCombat then
+            -- Detectar si el oponente está atacando
+            combatState.opponentAttacking = self:detectOpponentAttacking(screenGui)
+            
+            -- Detectar si el oponente está aturdido
+            combatState.opponentStunned = self:detectOpponentStunned(screenGui)
+            
+            -- Detectar si un bloqueo fue exitoso
+            combatState.blockSuccessful = self:detectBlockSuccessful(screenGui)
+            
+            -- Detectar oportunidad de contraataque
+            combatState.counterOpportunity = self:detectCounterOpportunity(
+                combatState.opponentAttacking,
+                combatState.opponentStunned,
+                combatState.blockSuccessful
+            )
+        end
+        
+        -- Actualizar historial para estabilidad
+        self:updateCombatStateHistory(combatState)
+        
+        -- Calcular tiempo de análisis
+        local analysisTime = os.clock() - startTime
+        
+        return combatState, analysisTime
+    end
+    
+    return detector
+end
+
+-- Detectar si el jugador está en combate
+function ScreenAnalyzer:detectInCombatState(uiValues, screenGui)
+    -- Método 1: Verificar barras de vida visibles
+    local hasHealthBars = uiValues.playerHealth < 100 or uiValues.opponentHealth < 100
+    
+    -- Método 2: Verificar elementos UI específicos de combate
+    local hasCombatUI = false
+    if screenGui then
+        -- Buscar elementos UI específicos de combate (botones de acción, indicadores, etc.)
+        for _, child in pairs(screenGui:GetDescendants()) do
+            local name = child.Name:lower()
+            if name:find("fight") or name:find("combat") or name:find("battle") or
+               name:find("pelea") or name:find("combate") then
+                hasCombatUI = true
+                break
+            end
+        end
+    end
+    
+    -- Método 3: Verificar tiempo de round activo
+    local hasActiveRound = uiValues.roundTime > 0 and uiValues.roundTime < 180
+    
+    -- Método 4: Verificar si hay combo activo
+    local hasActiveCombo = uiValues.comboCount > 0
+    
+    -- Combinar resultados (ponderados)
+    local inCombatScore = 0
+    if hasHealthBars then inCombatScore = inCombatScore + 2 end
+    if hasCombatUI then inCombatScore = inCombatScore + 1 end
+    if hasActiveRound then inCombatScore = inCombatScore + 2 end
+    if hasActiveCombo then inCombatScore = inCombatScore + 3 end
+    
+    -- Estabilizar con historial
+    if #self.detectors.combatState.history.inCombat > 0 then
+        local lastInCombat = self.detectors.combatState.history.inCombat[#self.detectors.combatState.history.inCombat]
+        if lastInCombat then
+            inCombatScore = inCombatScore + 1
+        end
+    end
+    
+    return inCombatScore >= 3
+end
+
+-- Detectar si el oponente está atacando
+function ScreenAnalyzer:detectOpponentAttacking(screenGui)
+    -- Método 1: Buscar efectos visuales de ataque
+    local hasAttackEffects = false
+    if screenGui then
+        for _, child in pairs(screenGui:GetDescendants()) do
+            -- Buscar efectos visuales típicos de ataques (partículas, flashes, etc.)
+            if child:IsA("ParticleEmitter") or child:IsA("Beam") or child:IsA("Trail") then
+                hasAttackEffects = true
+                break
+            end
+            
+            -- Buscar imágenes o UI con nombres relacionados a ataques
+            local name = child.Name:lower()
+            if name:find("attack") or name:find("hit") or name:find("punch") or
+               name:find("ataque") or name:find("golpe") then
+                hasAttackEffects = true
+                break
+            end
+        end
+    end
+    
+    -- Método 2: Analizar cambios recientes en la salud del jugador
+    local healthDropping = false
+    if #self.detectors.combatState.history.inCombat >= 2 then
+        local currentHealth = self.detectedState.combat.playerHealth
+        local previousHealth = self.detectedState.combat.playerHealth
+        
+        if currentHealth < previousHealth then
+            healthDropping = true
+        end
+    end
+    
+    -- Método 3: Buscar indicadores específicos de ataque enemigo
+    local hasAttackIndicator = false
+    if screenGui then
+        for _, child in pairs(screenGui:GetDescendants()) do
+            if child:IsA("ImageLabel") or child:IsA("Frame") then
+                -- Buscar indicadores visuales de ataque (flechas, iconos de advertencia, etc.)
+                local name = child.Name:lower()
+                if name:find("warning") or name:find("alert") or name:find("indicator") or
+                   name:find("advertencia") or name:find("alerta") then
+                    hasAttackIndicator = true
+                    break
+                end
+            end
+        end
+    end
+    
+    -- Combinar resultados
+    local attackingScore = 0
+    if hasAttackEffects then attackingScore = attackingScore + 2 end
+    if healthDropping then attackingScore = attackingScore + 3 end
+    if hasAttackIndicator then attackingScore = attackingScore + 2 end
+    
+    -- Estabilizar con historial
+    if #self.detectors.combatState.history.opponentAttacking > 0 then
+        local lastAttacking = self.detectors.combatState.history.opponentAttacking[#self.detectors.combatState.history.opponentAttacking]
+        if lastAttacking then
+            attackingScore = attackingScore + 1
+        end
+    end
+    
+    return attackingScore >= 3
+end
+
+-- Detectar si el oponente está aturdido
+function ScreenAnalyzer:detectOpponentStunned(screenGui)
+    -- Método 1: Buscar efectos visuales de aturdimiento
+    local hasStunEffects = false
+    if screenGui then
+        for _, child in pairs(screenGui:GetDescendants()) do
+            -- Buscar efectos visuales típicos de aturdimiento (estrellas, espirales, etc.)
+            if child:IsA("ParticleEmitter") or child:IsA("ImageLabel") then
+                local name = child.Name:lower()
+                if name:find("stun") or name:find("dizzy") or name:find("stars") or
+                   name:find("aturdido") or name:find("mareado") then
+                    hasStunEffects = true
+                    break
+                end
+            end
+        end
+    end
+    
+    -- Método 2: Buscar indicadores de texto de aturdimiento
+    local hasStunText = false
+    if screenGui then
+        for _, child in pairs(screenGui:GetDescendants()) do
+            if child:IsA("TextLabel") then
+                local text = child.Text:lower()
+                if text:find("stun") or text:find("dizzy") or text:find("stunned") or
+                   text:find("aturdido") or text:find("mareado") then
+                    hasStunText = true
+                    break
+                end
+            end
+        end
+    end
+    
+    -- Método 3: Analizar patrones de movimiento del oponente
+    -- (Simplificado para este ejemplo, en una implementación real se analizaría el modelo 3D)
+    local hasStunAnimation = false
+    
+    -- Combinar resultados
+    local stunnedScore = 0
+    if hasStunEffects then stunnedScore = stunnedScore + 3 end
+    if hasStunText then stunnedScore = stunnedScore + 2 end
+    if hasStunAnimation then stunnedScore = stunnedScore + 2 end
+    
+    -- Estabilizar con historial
+    if #self.detectors.combatState.history.opponentStunned > 0 then
+        local lastStunned = self.detectors.combatState.history.opponentStunned[#self.detectors.combatState.history.opponentStunned]
+        if lastStunned then
+            stunnedScore = stunnedScore + 1
+        end
+    end
+    
+    return stunnedScore >= 3
+end
+
+-- Detectar si un bloqueo fue exitoso
+function ScreenAnalyzer:detectBlockSuccessful(screenGui)
+    -- Método 1: Buscar efectos visuales de bloqueo exitoso
+    local hasBlockEffects = false
+    if screenGui then
+        for _, child in pairs(screenGui:GetDescendants()) do
+            -- Buscar efectos visuales típicos de bloqueo (escudos, destellos, etc.)
+            if child:IsA("ParticleEmitter") or child:IsA("ImageLabel") then
+                local name = child.Name:lower()
+                if name:find("block") or name:find("shield") or name:find("defend") or
+                   name:find("bloqueo") or name:find("escudo") or name:find("defensa") then
+                    hasBlockEffects = true
+                    break
+                end
+            end
+        end
+    end
+    
+    -- Método 2: Buscar indicadores de texto de bloqueo
+    local hasBlockText = false
+    if screenGui then
+        for _, child in pairs(screenGui:GetDescendants()) do
+            if child:IsA("TextLabel") then
+                local text = child.Text:lower()
+                if text:find("block") or text:find("blocked") or text:find("perfect") or
+                   text:find("bloqueado") or text:find("perfecto") then
+                    hasBlockText = true
+                    break
+                end
+            end
+        end
+    end
+    
+    -- Método 3: Analizar cambios en la salud (no debería bajar si el bloqueo es exitoso)
+    local healthStable = false
+    if self.detectors.combatState.currentState.opponentAttacking and
+       #self.detectors.combatState.history.inCombat >= 2 then
+        local currentHealth = self.detectedState.combat.playerHealth
+        local previousHealth = self.detectedState.combat.playerHealth
+        
+        if math.abs(currentHealth - previousHealth) < 1 then
+            healthStable = true
+        end
+    end
+    
+    -- Combinar resultados
+    local blockScore = 0
+    if hasBlockEffects then blockScore = blockScore + 2 end
+    if hasBlockText then blockScore = blockScore + 3 end
+    if healthStable then blockScore = blockScore + 2 end
+    
+    return blockScore >= 3
+end
+
+-- Detectar oportunidad de contraataque
+function ScreenAnalyzer:detectCounterOpportunity(opponentAttacking, opponentStunned, blockSuccessful)
+    -- Lógica para determinar oportunidades de contraataque
+    
+    -- Caso 1: Oponente aturdido
+    if opponentStunned then
+        return true
+    end
+    
+    -- Caso 2: Bloqueo exitoso seguido de ventana de contraataque
+    if blockSuccessful and not opponentAttacking then
+        return true
+    end
+    
+    -- Caso 3: Oponente acaba de terminar un ataque (ventana de recuperación)
+    if #self.detectors.combatState.history.opponentAttacking >= 2 then
+        local currentAttacking = opponentAttacking
+        local previousAttacking = self.detectors.combatState.history.opponentAttacking[#self.detectors.combatState.history.opponentAttacking]
+        
+        if previousAttacking and not currentAttacking then
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- Actualizar historial de estados de combate
+function ScreenAnalyzer:updateCombatStateHistory(combatState)
+    -- Actualizar historial de inCombat
+    table.insert(self.detectors.combatState.history.inCombat, combatState.inCombat)
+    if #self.detectors.combatState.history.inCombat > self.detectors.combatState.history.maxHistorySize then
+        table.remove(self.detectors.combatState.history.inCombat, 1)
+    end
+    
+    -- Actualizar historial de opponentAttacking
+    table.insert(self.detectors.combatState.history.opponentAttacking, combatState.opponentAttacking)
+    if #self.detectors.combatState.history.opponentAttacking > self.detectors.combatState.history.maxHistorySize then
+        table.remove(self.detectors.combatState.history.opponentAttacking, 1)
+    end
+    
+    -- Actualizar historial de opponentStunned
+    table.insert(self.detectors.combatState.history.opponentStunned, combatState.opponentStunned)
+    if #self.detectors.combatState.history.opponentStunned > self.detectors.combatState.history.maxHistorySize then
+        table.remove(self.detectors.combatState.history.opponentStunned, 1)
+    end
+    
+    -- Actualizar estado actual
+    self.detectors.combatState.currentState = combatState
+end
+
+-- Determinar oportunidades de acción basadas en el estado de combate
+function ScreenAnalyzer:determineOpportunities(combatState, uiValues)
+    local opportunities = {
+        canAttack = false,
+        shouldDodge = false,
+        shouldBlock = false,
+        counterAttackWindow = false,
+        comboOpportunity = false
+    }
+    
+    -- Determinar si puede atacar
+    opportunities.canAttack = combatState.inCombat and 
+                             uiValues.playerStamina > 20 and
+                             not combatState.opponentAttacking
+    
+    -- Determinar si debe esquivar
+    opportunities.shouldDodge = combatState.inCombat and 
+                               combatState.opponentAttacking and
+                               uiValues.playerStamina > 10
+    
+    -- Determinar si debe bloquear
+    opportunities.shouldBlock = combatState.inCombat and 
+                               combatState.opponentAttacking and
+                               uiValues.playerStamina <= 10
+    
+    -- Determinar ventana de contraataque
+    opportunities.counterAttackWindow = combatState.counterOpportunity and
+                                       uiValues.playerStamina > 30
+    
+    -- Determinar oportunidad de combo
+    opportunities.comboOpportunity = opportunities.canAttack and
+                                    uiValues.playerStamina > 50 and
+                                    (uiValues.comboCount > 0 or combatState.opponentStunned)
+    
+    return opportunities
+end
+
+
+--==============================================================================
+-- RECONOCIMIENTO DE POSICIONES Y ANIMACIONES
+--==============================================================================
+
+-- Crear detector de posiciones
+function ScreenAnalyzer:createPositionDetector()
+    local detector = {
+        -- Posiciones actuales
+        positions = {
+            playerPosition = Vector3.new(0, 0, 0),
+            opponentPosition = Vector3.new(0, 0, 0),
+            distanceToOpponent = DISTANCES.MEDIUM,
+            nearEdge = false,
+            movingDirection = Vector3.new(0, 0, 0)
+        },
+        
+        -- Historial de posiciones para análisis de movimiento
+        history = {
+            playerPositions = {},
+            opponentPositions = {},
+            maxHistorySize = 10
+        }
+    }
+    
+    -- Métodos del detector
+    detector.analyzePositions = function(self)
+        local startTime = os.clock()
+        local positionData = {
+            playerPosition = Vector3.new(0, 0, 0),
+            opponentPosition = Vector3.new(0, 0, 0),
+            distanceToOpponent = DISTANCES.MEDIUM,
+            nearEdge = false,
+            movingDirection = Vector3.new(0, 0, 0)
+        }
+        
+        -- Obtener posiciones de los personajes
+        local success, result = pcall(function()
+            return self:getCharacterPositions()
+        end)
+        
+        if success and result then
+            positionData.playerPosition = result.playerPosition
+            positionData.opponentPosition = result.opponentPosition
+            
+            -- Calcular distancia al oponente
+            positionData.distanceToOpponent = self:calculateDistance(
+                positionData.playerPosition,
+                positionData.opponentPosition
+            )
+            
+            -- Detectar si está cerca del borde
+            positionData.nearEdge = self:detectNearEdge(positionData.playerPosition)
+            
+            -- Calcular dirección de movimiento
+            positionData.movingDirection = self:calculateMovementDirection(
+                positionData.playerPosition,
+                positionData.opponentPosition
+            )
+            
+            -- Actualizar historial de posiciones
+            self:updatePositionHistory(positionData)
+        end
+        
+        -- Calcular tiempo de análisis
+        local analysisTime = os.clock() - startTime
+        
+        return positionData, analysisTime
+    end
+    
+    return detector
+end
+
+-- Crear detector de animaciones
+function ScreenAnalyzer:createAnimationDetector()
+    local detector = {
+        -- Animaciones actuales
+        animations = {
+            opponentAttackAnim = false,
+            opponentBlockAnim = false,
+            perfectTimingIndicator = false,
+            impactEffect = false
+        },
+        
+        -- Historial de animaciones para estabilidad
+        history = {
+            opponentAttackAnim = {},
+            opponentBlockAnim = {},
+            maxHistorySize = 5
+        }
+    }
+    
+    -- Métodos del detector
+    detector.analyzeAnimations = function(self)
+        local startTime = os.clock()
+        local animationData = {
+            opponentAttackAnim = false,
+            opponentBlockAnim = false,
+            perfectTimingIndicator = false,
+            impactEffect = false
+        }
+        
+        -- Detectar animaciones de ataque del oponente
+        animationData.opponentAttackAnim = self:detectOpponentAttackAnimation()
+        
+        -- Detectar animaciones de bloqueo del oponente
+        animationData.opponentBlockAnim = self:detectOpponentBlockAnimation()
+        
+        -- Detectar indicadores de timing perfecto
+        animationData.perfectTimingIndicator = self:detectPerfectTimingIndicator()
+        
+        -- Detectar efectos de impacto
+        animationData.impactEffect = self:detectImpactEffect()
+        
+        -- Actualizar historial de animaciones
+        self:updateAnimationHistory(animationData)
+        
+        -- Calcular tiempo de análisis
+        local analysisTime = os.clock() - startTime
+        
+        return animationData, analysisTime
+    end
+    
+    return detector
+end
+
+-- Obtener posiciones de los personajes
+function ScreenAnalyzer:getCharacterPositions()
+    local positions = {
+        playerPosition = Vector3.new(0, 0, 0),
+        opponentPosition = Vector3.new(0, 0, 0)
+    }
+    
+    -- Intentar obtener el personaje del jugador
+    local playerCharacter = nil
+    if LocalPlayer then
+        playerCharacter = LocalPlayer.Character
+    end
+    
+    -- Si tenemos el personaje del jugador, obtener su posición
+    if playerCharacter and playerCharacter:FindFirstChild("HumanoidRootPart") then
+        positions.playerPosition = playerCharacter.HumanoidRootPart.Position
+    end
+    
+    -- Buscar el oponente más cercano
+    local closestOpponent = nil
+    local closestDistance = math.huge
+    
+    for _, player in pairs(Players:GetPlayers()) do
+        -- Ignorar al jugador local
+        if player ~= LocalPlayer then
+            local character = player.Character
+            if character and character:FindFirstChild("HumanoidRootPart") then
+                local distance = (positions.playerPosition - character.HumanoidRootPart.Position).Magnitude
+                if distance < closestDistance then
+                    closestDistance = distance
+                    closestOpponent = character
+                end
+            end
+        end
+    end
+    
+    -- Si no encontramos jugadores, buscar NPCs
+    if not closestOpponent then
+        for _, model in pairs(workspace:GetChildren()) do
+            if model:IsA("Model") and model ~= playerCharacter and
+               model:FindFirstChild("Humanoid") and model:FindFirstChild("HumanoidRootPart") then
+                local distance = (positions.playerPosition - model.HumanoidRootPart.Position).Magnitude
+                if distance < closestDistance and distance < 100 then -- Limitar distancia para NPCs
+                    closestDistance = distance
+                    closestOpponent = model
+                end
+            end
+        end
+    end
+    
+    -- Si encontramos un oponente, obtener su posición
+    if closestOpponent and closestOpponent:FindFirstChild("HumanoidRootPart") then
+        positions.opponentPosition = closestOpponent.HumanoidRootPart.Position
+    end
+    
+    return positions
+end
+
+-- Calcular distancia al oponente
+function ScreenAnalyzer:calculateDistance(playerPos, opponentPos)
+    local distance = (playerPos - opponentPos).Magnitude
+    
+    -- Clasificar distancia según umbrales
+    if distance < self.analysisConfig.distanceThreshold.close then
+        return DISTANCES.CLOSE
+    elseif distance < self.analysisConfig.distanceThreshold.medium then
+        return DISTANCES.MEDIUM
+    else
+        return DISTANCES.FAR
+    end
+end
+
+-- Detectar si está cerca del borde
+function ScreenAnalyzer:detectNearEdge(playerPos)
+    -- Simplificado: en una implementación real, se verificaría la geometría del ring/arena
+    
+    -- Método 1: Verificar distancia a los límites del workspace
+    local workspaceBounds = workspace:GetBoundingBox()
+    local minBound = workspaceBounds.Min
+    local maxBound = workspaceBounds.Max
+    
+    -- Calcular distancias a los bordes
+    local distanceToMinX = math.abs(playerPos.X - minBound.X)
+    local distanceToMaxX = math.abs(playerPos.X - maxBound.X)
+    local distanceToMinZ = math.abs(playerPos.Z - minBound.Z)
+    local distanceToMaxZ = math.abs(playerPos.Z - maxBound.Z)
+    
+    -- Umbral para considerar "cerca del borde"
+    local edgeThreshold = 10
+    
+    return distanceToMinX < edgeThreshold or
+           distanceToMaxX < edgeThreshold or
+           distanceToMinZ < edgeThreshold or
+           distanceToMaxZ < edgeThreshold
+end
+
+-- Calcular dirección de movimiento
+function ScreenAnalyzer:calculateMovementDirection(playerPos, opponentPos)
+    -- Dirección hacia el oponente
+    local directionToOpponent = (opponentPos - playerPos).Unit
+    
+    -- Si tenemos suficiente historial, calcular dirección de movimiento del jugador
+    if #self.detectors.positions.history.playerPositions >= 2 then
+        local currentPos = playerPos
+        local previousPos = self.detectors.positions.history.playerPositions[#self.detectors.positions.history.playerPositions]
+        
+        -- Calcular vector de movimiento
+        local movementVector = (currentPos - previousPos)
+        
+        -- Si la magnitud es significativa, normalizar
+        if movementVector.Magnitude > 0.1 then
+            return movementVector.Unit
+        end
+    end
+    
+    -- Por defecto, devolver dirección hacia el oponente
+    return directionToOpponent
+end
+
+-- Actualizar historial de posiciones
+function ScreenAnalyzer:updatePositionHistory(positionData)
+    -- Actualizar historial de posiciones del jugador
+    table.insert(self.detectors.positions.history.playerPositions, positionData.playerPosition)
+    if #self.detectors.positions.history.playerPositions > self.detectors.positions.history.maxHistorySize then
+        table.remove(self.detectors.positions.history.playerPositions, 1)
+    end
+    
+    -- Actualizar historial de posiciones del oponente
+    table.insert(self.detectors.positions.history.opponentPositions, positionData.opponentPosition)
+    if #self.detectors.positions.history.opponentPositions > self.detectors.positions.history.maxHistorySize then
+        table.remove(self.detectors.positions.history.opponentPositions, 1)
+    end
+    
+    -- Actualizar posiciones actuales
+    self.detectors.positions.positions = positionData
+end
+
+-- Detectar animación de ataque del oponente
+function ScreenAnalyzer:detectOpponentAttackAnimation()
+    -- Simplificado: en una implementación real, se analizaría el estado de animación del modelo
+    
+    -- Método 1: Verificar si el oponente está en estado de ataque según el detector de combate
+    if self.detectors.combatState and self.detectors.combatState.currentState then
+        if self.detectors.combatState.currentState.opponentAttacking then
+            return true
+        end
+    end
+    
+    -- Método 2: Analizar cambios en la posición del oponente
+    if #self.detectors.positions.history.opponentPositions >= 3 then
+        local positions = self.detectors.positions.history.opponentPositions
+        local current = positions[#positions]
+        local previous = positions[#positions - 1]
+        local beforePrevious = positions[#positions - 2]
+        
+        -- Calcular velocidades
+        local currentVelocity = (current - previous).Magnitude
+        local previousVelocity = (previous - beforePrevious).Magnitude
+        
+        -- Patrón típico de ataque: aceleración seguida de desaceleración
+        if currentVelocity > previousVelocity * 1.5 then
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- Detectar animación de bloqueo del oponente
+function ScreenAnalyzer:detectOpponentBlockAnimation()
+    -- Simplificado: en una implementación real, se analizaría el estado de animación del modelo
+    
+    -- Método 1: Verificar cambios en la posición del oponente (típicamente se queda quieto al bloquear)
+    if #self.detectors.positions.history.opponentPositions >= 3 then
+        local positions = self.detectors.positions.history.opponentPositions
+        local current = positions[#positions]
+        local previous = positions[#positions - 1]
+        local beforePrevious = positions[#positions - 2]
+        
+        -- Calcular velocidades
+        local currentVelocity = (current - previous).Magnitude
+        local previousVelocity = (previous - beforePrevious).Magnitude
+        
+        -- Patrón típico de bloqueo: movimiento mínimo
+        if currentVelocity < 0.1 and previousVelocity < 0.1 then
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- Detectar indicador de timing perfecto
+function ScreenAnalyzer:detectPerfectTimingIndicator()
+    -- Buscar indicadores visuales de timing perfecto en la UI
+    local screenGui = self.gameUI.screenGui
+    if not screenGui then return false end
+    
+    -- Buscar elementos visuales específicos
+    for _, child in pairs(screenGui:GetDescendants()) do
+        -- Buscar por nombre
+        local name = child.Name:lower()
+        if name:find("perfect") or name:find("timing") or name:find("indicator") or
+           name:find("perfecto") or name:find("tiempo") then
+            -- Verificar si es visible
+            if child:IsA("Frame") or child:IsA("ImageLabel") or child:IsA("TextLabel") then
+                if child.Visible then
+                    return true
+                end
+            end
+        end
+        
+        -- Buscar por texto
+        if child:IsA("TextLabel") and child.Visible then
+            local text = child.Text:lower()
+            if text:find("perfect") or text:find("perfecto") or text:find("!") then
+                return true
+            end
+        end
+    end
+    
+    return false
+end
+
+-- Detectar efecto de impacto
+function ScreenAnalyzer:detectImpactEffect()
+    -- Buscar efectos visuales de impacto en la UI
+    local screenGui = self.gameUI.screenGui
+    if not screenGui then return false end
+    
+    -- Buscar elementos visuales específicos
+    for _, child in pairs(screenGui:GetDescendants()) do
+        -- Buscar por nombre
+        local name = child.Name:lower()
+        if name:find("impact") or name:find("hit") or name:find("effect") or
+           name:find("impacto") or name:find("golpe") then
+            -- Verificar si es visible
+            if child:IsA("Frame") or child:IsA("ImageLabel") or child:IsA("ParticleEmitter") then
+                if child.Visible then
+                    return true
+                end
+            end
+        end
+    end
+    
+    -- Buscar efectos en el workspace (simplificado)
+    for _, effect in pairs(workspace:GetDescendants()) do
+        if effect:IsA("ParticleEmitter") or effect:IsA("Beam") or effect:IsA("Trail") then
+            local name = effect.Name:lower()
+            if name:find("impact") or name:find("hit") or name:find("effect") then
+                if effect.Enabled then
+                    return true
+                end
+            end
+        end
+    end
+    
+    return false
+end
+
+-- Actualizar historial de animaciones
+function ScreenAnalyzer:updateAnimationHistory(animationData)
+    -- Actualizar historial de animación de ataque
+    table.insert(self.detectors.animations.history.opponentAttackAnim, animationData.opponentAttackAnim)
+    if #self.detectors.animations.history.opponentAttackAnim > self.detectors.animations.history.maxHistorySize then
+        table.remove(self.detectors.animations.history.opponentAttackAnim, 1)
+    end
+    
+    -- Actualizar historial de animación de bloqueo
+    table.insert(self.detectors.animations.history.opponentBlockAnim, animationData.opponentBlockAnim)
+    if #self.detectors.animations.history.opponentBlockAnim > self.detectors.animations.history.maxHistorySize then
+        table.remove(self.detectors.animations.history.opponentBlockAnim, 1)
+    end
+    
+    -- Actualizar animaciones actuales
+    self.detectors.animations.animations = animationData
+end
+
+
+--==============================================================================
+-- INTEGRACIÓN CON SISTEMA EXISTENTE Y OPTIMIZACIONES
+--==============================================================================
+
+-- Método principal para analizar el estado del juego
+function ScreenAnalyzer:analyzeGameState()
+    -- Verificar si el analizador está inicializado
+    if not self.isInitialized then
+        warn("[ScreenAnalyzer] No inicializado, intentando reinicializar...")
+        self:initialize()
+        if not self.isInitialized then
+            return self:getDefaultGameState()
+        end
+    end
+    
+    -- Verificar intervalo de análisis
+    local currentTime = os.clock()
+    if currentTime - self.lastAnalysisTime < self.analysisInterval then
+        -- Devolver estado en caché si está disponible
+        if self.cache.gameState and 
+           currentTime - self.cache.lastCacheTime < self.analysisConfig.cacheTimeout then
+            return self.cache.gameState
+        end
+    end
+    
+    -- Marcar inicio de análisis
+    self.isAnalyzing = true
+    self.lastAnalysisTime = currentTime
+    local analysisStartTime = currentTime
+    
+    -- Actualizar referencias de UI si es necesario
+    if not self.gameUI.screenGui or not self.gameUI.camera then
+        self:updateUIReferences()
+    end
+    
+    -- Realizar análisis completo
+    local success, gameState = pcall(function()
+        return self:performCompleteAnalysis()
+    end)
+    
+    if not success then
+        warn("[ScreenAnalyzer] Error en análisis:", gameState)
+        gameState = self:getDefaultGameState()
+    end
+    
+    -- Calcular tiempo total de análisis
+    local totalAnalysisTime = os.clock() - analysisStartTime
+    gameState.visual.lastAnalysisTime = totalAnalysisTime
+    
+    -- Actualizar estadísticas de rendimiento
+    self:updatePerformanceStats(totalAnalysisTime, success)
+    
+    -- Actualizar caché
+    self.cache.gameState = gameState
+    self.cache.lastCacheTime = currentTime
+    
+    -- Marcar fin de análisis
+    self.isAnalyzing = false
+    
+    -- Llamar callbacks si están definidos
+    if self.callbacks.onAnalysisComplete then
+        self.callbacks.onAnalysisComplete(gameState)
+    end
+    
+    return gameState
+end
+
+-- Realizar análisis completo
+function ScreenAnalyzer:performCompleteAnalysis()
+    local gameState = self:getDefaultGameState()
+    
+    -- Paso 1: Detectar elementos UI
+    local detectedElements, uiAnalysisTime = self.detectors.uiElements:detectAllElements(self.gameUI.screenGui)
+    
+    -- Paso 2: Extraer valores de los elementos UI
+    local uiValues = self:extractUIValues(detectedElements)
+    
+    -- Paso 3: Analizar estado de combate
+    local combatState, combatAnalysisTime = self.detectors.combatState:analyzeCombatState(uiValues, self.gameUI.screenGui)
+    
+    -- Paso 4: Analizar posiciones
+    local positionData, positionAnalysisTime = self.detectors.positions:analyzePositions()
+    
+    -- Paso 5: Analizar animaciones
+    local animationData, animationAnalysisTime = self.detectors.animations:analyzeAnimations()
+    
+    -- Paso 6: Determinar oportunidades
+    local opportunities = self:determineOpportunities(combatState, uiValues)
+    
+    -- Paso 7: Determinar fase del juego
+    local gamePhase = self:determineGamePhase(combatState, uiValues)
+    
+    -- Paso 8: Calcular confiabilidad del análisis
+    local reliability = self:calculateAnalysisReliability(detectedElements, combatState, positionData)
+    
+    -- Construir estado del juego
+    gameState.combat = {
+        inCombat = combatState.inCombat,
+        playerHealth = uiValues.playerHealth,
+        opponentHealth = uiValues.opponentHealth,
+        playerStamina = uiValues.playerStamina,
+        opponentStunned = combatState.opponentStunned,
+        distanceToOpponent = positionData.distanceToOpponent
+    }
+    
+    gameState.opportunities = opportunities
+    
+    gameState.environment = {
+        nearEdge = positionData.nearEdge,
+        roundTimeLeft = uiValues.roundTime,
+        currentRound = uiValues.currentRound,
+        gamePhase = gamePhase
+    }
+    
+    gameState.visual = {
+        lastAnalysisTime = uiAnalysisTime + combatAnalysisTime + positionAnalysisTime + animationAnalysisTime,
+        analysisReliability = reliability,
+        screenResolution = self.gameUI.viewport,
+        frameRate = self.performance.frameRate
+    }
+    
+    -- Actualizar estado detectado interno
+    self.detectedState = gameState
+    
+    return gameState
+end
+
+-- Determinar fase del juego
+function ScreenAnalyzer:determineGamePhase(combatState, uiValues)
+    -- Verificar si está en menú
+    if not combatState.inCombat and uiValues.playerHealth >= 100 and uiValues.opponentHealth >= 100 then
+        return COMBAT_STATES.MENU
+    end
+    
+    -- Verificar si está en combate
+    if combatState.inCombat and uiValues.roundTime > 0 then
+        return COMBAT_STATES.COMBAT
+    end
+    
+    -- Verificar si terminó el round
+    if uiValues.roundTime <= 0 and combatState.inCombat then
+        return COMBAT_STATES.ROUND_END
+    end
+    
+    -- Verificar victoria
+    if uiValues.opponentHealth <= 0 then
+        return COMBAT_STATES.VICTORY
+    end
+    
+    -- Verificar derrota
+    if uiValues.playerHealth <= 0 then
+        return COMBAT_STATES.DEFEAT
+    end
+    
+    -- Por defecto, asumir que está cargando
+    return COMBAT_STATES.LOADING
+end
+
+-- Calcular confiabilidad del análisis
+function ScreenAnalyzer:calculateAnalysisReliability(detectedElements, combatState, positionData)
+    local reliability = 0
+    local maxReliability = 10
+    
+    -- Confiabilidad basada en elementos UI detectados
+    if detectedElements.playerHealth then reliability = reliability + 2 end
+    if detectedElements.opponentHealth then reliability = reliability + 2 end
+    if detectedElements.playerStamina then reliability = reliability + 1 end
+    if detectedElements.roundTimer then reliability = reliability + 1 end
+    if detectedElements.roundCounter then reliability = reliability + 1 end
+    
+    -- Confiabilidad basada en coherencia de datos
+    if combatState.inCombat then
+        reliability = reliability + 1
+    end
+    
+    -- Confiabilidad basada en posiciones válidas
+    if positionData.playerPosition.Magnitude > 0 and positionData.opponentPosition.Magnitude > 0 then
+        reliability = reliability + 2
+    end
+    
+    -- Normalizar a escala 0-1
+    return math.min(reliability / maxReliability, 1)
+end
+
+-- Obtener estado del juego por defecto
+function ScreenAnalyzer:getDefaultGameState()
+    return {
+        combat = {
+            inCombat = false,
+            playerHealth = 100,
+            opponentHealth = 100,
+            playerStamina = 100,
+            opponentStunned = false,
+            distanceToOpponent = DISTANCES.MEDIUM
+        },
+        opportunities = {
+            canAttack = false,
+            shouldDodge = false,
+            shouldBlock = false,
+            counterAttackWindow = false,
+            comboOpportunity = false
+        },
+        environment = {
+            nearEdge = false,
+            roundTimeLeft = 180,
+            currentRound = 1,
+            gamePhase = COMBAT_STATES.MENU
+        },
+        visual = {
+            lastAnalysisTime = 0,
+            analysisReliability = 0,
+            screenResolution = self.gameUI.viewport,
+            frameRate = 60
+        }
+    }
+end
+
+-- Actualizar estadísticas de rendimiento
+function ScreenAnalyzer:updatePerformanceStats(analysisTime, success)
+    self.performance.totalAnalyses = self.performance.totalAnalyses + 1
+    
+    if success then
+        self.performance.successfulAnalyses = self.performance.successfulAnalyses + 1
+    end
+    
+    -- Calcular tiempo promedio de análisis
+    local totalTime = self.performance.averageAnalysisTime * (self.performance.totalAnalyses - 1) + analysisTime
+    self.performance.averageAnalysisTime = totalTime / self.performance.totalAnalyses
+    
+    -- Calcular FPS
+    local currentTime = os.clock()
+    if self.performance.lastFrameTime > 0 then
+        local deltaTime = currentTime - self.performance.lastFrameTime
+        if deltaTime > 0 then
+            self.performance.frameRate = 1 / deltaTime
+        end
+    end
+    self.performance.lastFrameTime = currentTime
+    
+    -- Ajustar intervalo de análisis basado en rendimiento
+    self:adjustAnalysisInterval()
+end
+
+-- Ajustar intervalo de análisis basado en rendimiento
+function ScreenAnalyzer:adjustAnalysisInterval()
+    -- Si el análisis toma demasiado tiempo, aumentar el intervalo
+    if self.performance.averageAnalysisTime > self.analysisConfig.maxAnalysisTime then
+        self.analysisInterval = self.analysisInterval * 1.1
+        print("[ScreenAnalyzer] Aumentando intervalo de análisis a:", self.analysisInterval)
+    elseif self.performance.averageAnalysisTime < self.analysisConfig.maxAnalysisTime * 0.5 then
+        -- Si el análisis es rápido, disminuir el intervalo (pero no menos que el mínimo)
+        local minInterval = self.config.screenAnalysisInterval or 0.06
+        self.analysisInterval = math.max(self.analysisInterval * 0.95, minInterval)
+    end
+end
+
+-- Establecer callback para cambios de estado
+function ScreenAnalyzer:setStateChangedCallback(callback)
+    self.callbacks.onStateChanged = callback
+end
+
+-- Establecer callback para elementos detectados
+function ScreenAnalyzer:setElementDetectedCallback(callback)
+    self.callbacks.onElementDetected = callback
+end
+
+-- Establecer callback para análisis completo
+function ScreenAnalyzer:setAnalysisCompleteCallback(callback)
+    self.callbacks.onAnalysisComplete = callback
+end
+
+-- Obtener estadísticas de rendimiento
+function ScreenAnalyzer:getPerformanceStats()
+    return {
+        totalAnalyses = self.performance.totalAnalyses,
+        successfulAnalyses = self.performance.successfulAnalyses,
+        successRate = self.performance.totalAnalyses > 0 and 
+                     (self.performance.successfulAnalyses / self.performance.totalAnalyses) or 0,
+        averageAnalysisTime = self.performance.averageAnalysisTime,
+        currentFrameRate = self.performance.frameRate,
+        currentInterval = self.analysisInterval
+    }
+end
+
+-- Reinicializar el analizador
+function ScreenAnalyzer:reinitialize()
+    print("[ScreenAnalyzer] Reinicializando...")
+    
+    -- Limpiar estado
+    self.isInitialized = false
+    self.isAnalyzing = false
+    self:clearCache()
+    
+    -- Reinicializar
+    self:initialize()
+    
+    return self.isInitialized
+end
+
+-- Destruir el analizador (limpieza)
+function ScreenAnalyzer:destroy()
+    print("[ScreenAnalyzer] Destruyendo...")
+    
+    -- Limpiar callbacks
+    self.callbacks = {}
+    
+    -- Limpiar caché
+    self:clearCache()
+    
+    -- Marcar como no inicializado
+    self.isInitialized = false
+    self.isAnalyzing = false
+end
+
+--==============================================================================
+-- MÉTODOS DE UTILIDAD Y DEBUGGING
+--==============================================================================
+
+-- Obtener información de debugging
+function ScreenAnalyzer:getDebugInfo()
+    return {
+        isInitialized = self.isInitialized,
+        isAnalyzing = self.isAnalyzing,
+        lastAnalysisTime = self.lastAnalysisTime,
+        analysisInterval = self.analysisInterval,
+        cacheSize = self.cache.gameState and 1 or 0,
+        deviceInfo = self.deviceInfo,
+        gameUIStatus = {
+            hasPlayerGui = self.gameUI.playerGui ~= nil,
+            hasScreenGui = self.gameUI.screenGui ~= nil,
+            hasCamera = self.gameUI.camera ~= nil,
+            viewport = self.gameUI.viewport
+        },
+        detectorStatus = {
+            hasUIDetector = self.detectors.uiElements ~= nil,
+            hasCombatDetector = self.detectors.combatState ~= nil,
+            hasPositionDetector = self.detectors.positions ~= nil,
+            hasAnimationDetector = self.detectors.animations ~= nil
+        },
+        performance = self:getPerformanceStats()
+    }
+end
+
+-- Forzar análisis inmediato (para debugging)
+function ScreenAnalyzer:forceAnalysis()
+    print("[ScreenAnalyzer] Forzando análisis inmediato...")
+    self.lastAnalysisTime = 0
+    return self:analyzeGameState()
+end
+
+-- Exportar configuración actual
+function ScreenAnalyzer:exportConfig()
+    return {
+        analysisConfig = self.analysisConfig,
+        analysisInterval = self.analysisInterval,
+        deviceInfo = self.deviceInfo
+    }
+end
+
+-- Importar configuración
+function ScreenAnalyzer:importConfig(config)
+    if config.analysisConfig then
+        for key, value in pairs(config.analysisConfig) do
+            self.analysisConfig[key] = value
+        end
+    end
+    
+    if config.analysisInterval then
+        self.analysisInterval = config.analysisInterval
+    end
+    
+    print("[ScreenAnalyzer] Configuración importada")
+end
+
+-- Destruir el analizador y limpiar recursos
+function ScreenAnalyzer:destroy()
+    print("[ScreenAnalyzer] Destruyendo...")
+    
+    -- Detener análisis
+    self.isAnalyzing = false
+    self.isInitialized = false
+    
+    -- Limpiar caché
+    self:clearCache()
+    
+    -- Limpiar callbacks
+    self.callbacks = {}
+    
+    -- Limpiar referencias
+    self.gameUI = {}
+    self.detectors = {}
+    
+    print("[ScreenAnalyzer] Destruido correctamente")
+end
+
+--==============================================================================
+-- RETORNO DEL MÓDULO
+--==============================================================================
+
+return ScreenAnalyzer
+
+
 -- MÓDULO: UnifiedInput
 --==============================================================================
 
@@ -3973,6 +6340,7 @@ function BoxingBetaAutoplayer:initializeModules()
     -- Inicializar módulos en orden de dependencia
     self.platformDetection = PlatformDetection.new()
     self.adaptiveConfig = AdaptiveConfig.new(self.platformDetection)
+    self.screenAnalyzer = ScreenAnalyzer.new(self.platformDetection, self.adaptiveConfig)
     self.responsiveUI = ResponsiveUI.new(self.platformDetection, self.adaptiveConfig)
     self.unifiedInput = UnifiedInput.new(self.platformDetection)
     self.touchControls = TouchControls.new(self.platformDetection, self.unifiedInput)
@@ -4195,6 +6563,112 @@ function BoxingBetaAutoplayer:updateStats()
     self.responsiveUI:updateStats(self.stats.learning, self.stats.execution)
 end
 
+-- Percibir el estado actual del juego usando ScreenAnalyzer
+function BoxingBetaAutoplayer:perceiveGameState()
+    if not self.screenAnalyzer or not self.screenAnalyzer.isInitialized then
+        return nil
+    end
+    
+    -- Realizar análisis de pantalla
+    local analysisResult = self.screenAnalyzer:analyzeScreen()
+    
+    if not analysisResult then
+        return nil
+    end
+    
+    -- Convertir resultado del análisis a estado del juego
+    local gameState = {
+        -- Estado de combate
+        inCombat = analysisResult.combat.inCombat,
+        playerHealth = analysisResult.combat.playerHealth,
+        opponentHealth = analysisResult.combat.opponentHealth,
+        playerStamina = analysisResult.combat.playerStamina,
+        opponentStunned = analysisResult.combat.opponentStunned,
+        distanceToOpponent = analysisResult.combat.distanceToOpponent,
+        
+        -- Oportunidades detectadas
+        canAttack = analysisResult.opportunities.canAttack,
+        shouldDodge = analysisResult.opportunities.shouldDodge,
+        shouldBlock = analysisResult.opportunities.shouldBlock,
+        counterAttackWindow = analysisResult.opportunities.counterAttackWindow,
+        comboOpportunity = analysisResult.opportunities.comboOpportunity,
+        
+        -- Estado del entorno
+        nearEdge = analysisResult.environment.nearEdge,
+        roundTimeLeft = analysisResult.environment.roundTimeLeft,
+        currentRound = analysisResult.environment.currentRound,
+        gamePhase = analysisResult.environment.gamePhase,
+        
+        -- Información visual
+        analysisReliability = analysisResult.visual.analysisReliability,
+        frameRate = analysisResult.visual.frameRate
+    }
+    
+    return gameState
+end
+
+-- Decidir acción basada en el estado del juego
+function BoxingBetaAutoplayer:decideAction(gameState)
+    if not gameState or not gameState.inCombat then
+        return nil
+    end
+    
+    -- Usar el motor de aprendizaje para decidir la acción
+    if self.learningEngine then
+        return self.learningEngine:selectAction(gameState)
+    end
+    
+    -- Fallback: lógica básica si no hay motor de aprendizaje
+    if gameState.shouldDodge then
+        return "dodge"
+    elseif gameState.shouldBlock then
+        return "block"
+    elseif gameState.canAttack and gameState.playerStamina > 20 then
+        if gameState.comboOpportunity then
+            return "combo_attack"
+        else
+            return "basic_attack"
+        end
+    end
+    
+    return nil
+end
+
+-- Ejecutar acción usando UnifiedInput
+function BoxingBetaAutoplayer:executeAction(action)
+    if not action or not self.unifiedInput then
+        return false
+    end
+    
+    -- Aplicar anti-detección si está habilitado
+    if self.antiDetection then
+        action = self.antiDetection:applyHumanization(action)
+    end
+    
+    -- Ejecutar acción a través del sistema de input unificado
+    local success = false
+    
+    if action == "basic_attack" then
+        success = self.unifiedInput:performAction("PUNCH")
+    elseif action == "combo_attack" then
+        success = self.unifiedInput:performAction("COMBO")
+    elseif action == "block" then
+        success = self.unifiedInput:performAction("BLOCK")
+    elseif action == "dodge" then
+        success = self.unifiedInput:performAction("DODGE")
+    end
+    
+    -- Registrar estadísticas de ejecución
+    if success then
+        self.stats.execution.actionsExecuted = self.stats.execution.actionsExecuted + 1
+        self.stats.execution.lastActionTime = os.clock()
+    else
+        self.stats.execution.actionsFailed = self.stats.execution.actionsFailed + 1
+    end
+    
+    return success
+end
+
 function BoxingBetaAutoplayer:destroy()
     print("Destruyendo BoxingBetaAutoplayer...")
 
@@ -4217,6 +6691,7 @@ function BoxingBetaAutoplayer:destroy()
     if self.performanceManager then self.performanceManager:destroy() end
     if self.touchControls then self.touchControls:destroy() end
     if self.unifiedInput then self.unifiedInput:destroy() end
+    if self.screenAnalyzer then self.screenAnalyzer:destroy() end
     if self.responsiveUI then end -- No tiene método destroy explícito
     if self.adaptiveConfig then end -- No tiene método destroy
     if self.platformDetection then end -- No tiene método destroy
