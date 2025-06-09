@@ -77,8 +77,7 @@ local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
 -- Cargar módulos de aprendizaje
-local LearningEngine = require("LearningEngine")
-local LearningConfigUI = require("LearningConfigUI")
+
 
 --==============================================================================
 -- MÓDULO: PlatformDetection
@@ -105,7 +104,7 @@ local RunService = game:GetService("RunService")
 local Stats = game:GetService("Stats")
 
 -- Módulo EventBus (para implementar patrón de eventos)
-local EventBus = require(script.Parent.EventBus)
+
 
 local PlatformDetection = {}
 PlatformDetection.__index = PlatformDetection
@@ -139,58 +138,19 @@ local TABLET_DIAGONAL_THRESHOLD = 1000 -- Umbral para considerar un dispositivo 
 function PlatformDetection.new(services)
     local self = setmetatable({}, PlatformDetection)
     
-    -- Inyección de dependencias (servicios)
-    self.userInputService = services and services.UserInputService or UserInputService
-    self.guiService = services and services.GuiService or GuiService
-    self.runService = services and services.RunService or RunService
-    self.stats = services and services.Stats or Stats
-    
-    -- Eventos
-    self.events = {
-        orientationChanged = EventBus.new(),
-        screenSizeChanged = EventBus.new(),
-        deviceInfoUpdated = EventBus.new()
-    }
-    
-    -- Información del dispositivo (con valores por defecto)
+    -- ELIMINAR eventos complejos, usar detección directa
     self.deviceInfo = {
-        deviceType = DEVICE_TYPES.UNKNOWN,
-        os = OS_TYPES.UNKNOWN,
-        touchEnabled = false,
-        keyboardEnabled = false,
-        mouseEnabled = false,
-        gamepadEnabled = false,
-        screenSize = Vector2.new(0, 0),
-        orientation = ORIENTATIONS.LANDSCAPE,
-        isMobile = false,
-        isTablet = false,
-        isConsole = false,
-        isPC = false,
-        -- Nuevos campos para capacidades de hardware
-        memoryUsageMb = 0,
-        cpuUsage = 0,
-        gpuUsage = 0,
-        networkLatencyMs = 0,
-        fps = 0
+        deviceType = "PC", -- Valor por defecto
+        touchEnabled = UserInputService.TouchEnabled,
+        keyboardEnabled = UserInputService.KeyboardEnabled,
+        mouseEnabled = UserInputService.MouseEnabled,
+        screenSize = workspace.CurrentCamera.ViewportSize
     }
     
-    -- Caché para reducir cálculos repetidos
-    self.cache = {
-        lastScreenSizeCheck = 0,
-        lastHardwareCheck = 0,
-        screenCheckInterval = 1, -- segundos
-        hardwareCheckInterval = 5 -- segundos
-    }
-        isTablet = false,
-        isConsole = false,
-        isPC = false
-    }
-    
-    -- Detectar información
-    self:detectPlatform()
-    
-    -- Conectar eventos para cambios (ej. orientación)
-    self:connectEvents()
+    -- Detectar plataforma simple
+    if self.deviceInfo.touchEnabled and not self.deviceInfo.keyboardEnabled then
+        self.deviceInfo.deviceType = "Mobile"
+    end
     
     return self
 end
@@ -6712,4 +6672,52 @@ print("Usa la interfaz para activar/desactivar el autoplayer.")
 _G.BoxingBetaAutoplayer.responsiveUI:show()
 
 return _G.BoxingBetaAutoplayer
+
+
+
+function ScreenAnalyzer:getCharacterPositions()
+    return {
+        playerPosition = Vector3.new(0, 0, 0),
+        opponentPosition = Vector3.new(0, 0, 0)
+    }
+end
+
+function ScreenAnalyzer:analyzeGameState()
+    return {
+        combat = {
+            inCombat = false,
+            playerHealth = 100,
+            opponentHealth = 100,
+            playerStamina = 100
+        },
+        opportunities = {
+            canAttack = false,
+            shouldDodge = false,
+            shouldBlock = false
+        }
+    }
+end
+
+
+
+function BoxingBetaAutoplayer:initializeModules()
+    print("Inicializando BoxingBetaAutoplayer v3.0...")
+    
+    -- SOLO módulos esenciales que funcionan
+    self.platformDetection = PlatformDetection.new()
+    self.adaptiveConfig = AdaptiveConfig.new(self.platformDetection)
+    self.responsiveUI = ResponsiveUI.new(self.platformDetection, self.adaptiveConfig)
+    
+    -- REMOVER módulos problemáticos temporalmente
+    -- self.screenAnalyzer = nil -- Desactivar hasta corregir
+    -- self.learningEngine = nil -- No existe
+    
+    -- Crear UI básica
+    pcall(function()
+        self.responsiveUI:createUI()
+    end)
+    
+    self.isInitialized = true
+    print("Inicialización básica completada")
+end
 
